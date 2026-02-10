@@ -128,7 +128,9 @@ struct Process
 	bool	isTracked = false;
 	wstring imageFilename;
 	wstring imagePath;
-	int		nextFree = -1;
+	int64_t startTime = 0;
+	int64_t stopTime  = 0;
+	int		nextFree  = -1;
 	void	Reset()
 	{
 		pid			  = (DWORD)-1;
@@ -502,7 +504,7 @@ bool ProcessCheckTracked(const wstring& path)
 	return false;
 }
 
-void OnProcessCreate(wstring imageName, DWORD processId, bool isRundown)
+void OnProcessCreate(wstring imageName, DWORD processId, uint64_t timeStamp, bool isRundown)
 {
 	(void)isRundown;
 	std::wstring fileName  = GetFileName(imageName);
@@ -510,12 +512,41 @@ void OnProcessCreate(wstring imageName, DWORD processId, bool isRundown)
 	process->imageFilename = fileName;
 	process->imagePath	   = imageName;
 	process->isTracked	   = ProcessCheckTracked(imageName);
+	process->startTime	   = timeStamp;
+	process->stopTime	   = 0;
 }
-void OnProcessStop(DWORD pid)
+void OnProcessStop(DWORD pid, uint64_t timestamp)
 {
-	Process* process = FindProcess(pid);
-	FreeProcess(process);
-	FreeProcessMemory(pid);
+	Process* process  = FindProcess(pid);
+	process->stopTime = timestamp;
+}
+
+// VidMm reports arrive even after the process is dead.
+// keep Process objects alive for 2 minutes, and then trim them
+void TrimProcesses()
+{
+	LARGE_INTEGER Freq, Counter;
+	QueryPerformanceFrequency(&Freq);
+	QueryPerformanceCounter(&Counter);
+	static int64_t LastUpdate = 0;
+	if(LastUpdate < Counter.QuadPart + Freq.QuadPart * 30)
+	{
+		LastUpdate	  = Counter.QuadPart;
+		int64_t limit = Counter.QuadPart + 120 * Freq.QuadPart;
+
+		for(Process& proc : g_processes)
+		{
+			DWORD pid = proc.pid;
+			if(pid != (DWORD)-1)
+			{
+				if(proc.stopTime > 0 && proc.stopTime < limit)
+				{
+					FreeProcess(&proc);
+					FreeProcessMemory(pid);
+				}
+			}
+		}
+	}
 }
 
 void HandleProcessStart(PEVENT_RECORD pEvent)
@@ -525,7 +556,7 @@ void HandleProcessStart(PEVENT_RECORD pEvent)
 	static const wchar_t*	 propImageName = GetPropertyOffset(pInfo, L"ImageName");
 	DWORD					 pid		   = GetProperty<DWORD>(pEvent, propProcessId);
 	wstring					 imageName	   = GetPropertyString(pEvent, propImageName);
-	OnProcessCreate(imageName, pid, false);
+	OnProcessCreate(imageName, pid, pEvent->EventHeader.TimeStamp.QuadPart, false);
 }
 void HandleProcessRundown(PEVENT_RECORD pEvent)
 {
@@ -534,14 +565,14 @@ void HandleProcessRundown(PEVENT_RECORD pEvent)
 	static const wchar_t*	 propImageName = GetPropertyOffset(pInfo, L"ImageName");
 	DWORD					 pid		   = GetProperty<DWORD>(pEvent, propProcessId);
 	wstring					 imageName	   = GetPropertyString(pEvent, propImageName);
-	OnProcessCreate(imageName, pid, true);
+	OnProcessCreate(imageName, pid, pEvent->EventHeader.TimeStamp.QuadPart, true);
 }
 void HandleProcessStop(PEVENT_RECORD pEvent)
 {
 	static PTRACE_EVENT_INFO pInfo		   = ExtractEventInformation(pEvent);
 	static const wchar_t*	 propProcessId = GetPropertyOffset(pInfo, L"ProcessID");
 	DWORD					 pid		   = GetProperty<DWORD>(pEvent, propProcessId);
-	OnProcessStop(pid);
+	OnProcessStop(pid, pEvent->EventHeader.TimeStamp.QuadPart);
 }
 
 void HandleProcessEvent(PEVENT_RECORD pEvent)
@@ -907,8 +938,8 @@ void GetConsoleSize(int& width, int& height)
 
 void FormatMemory(SIZE_T bytes, char* buffer, size_t bufSize)
 {
-	double	   b	 = (double)bytes;
-	int		   x	 = 0;
+	double b = (double)bytes;
+	int	   x = 0;
 	for(int i = 0; i < g_minSize; ++i)
 	{
 		b /= 1024.f;
@@ -1040,8 +1071,14 @@ void ConsoleUpdate()
 		}
 	} foo;
 
+	TrimProcesses();
 	static std::vector<ProcessMemory*> processes;
 	static std::vector<PVOID>		   adapters;
+	LARGE_INTEGER counterInt;
+	int64_t currentTime;
+	QueryPerformanceCounter(&counterInt);
+	currentTime = counterInt.QuadPart;
+
 
 	processes.clear();
 	adapters.clear();
@@ -1059,7 +1096,6 @@ void ConsoleUpdate()
 	std::sort(processes.begin(),
 			  processes.end(),
 			  [](const ProcessMemory* a, const ProcessMemory* b)
-
 			  {
 				  bool aTracked = a->isTracked;
 				  bool bTracked = b->isTracked;
@@ -1108,7 +1144,7 @@ void ConsoleUpdate()
 	if(g_detailedAvailable && g_detailedMode)
 	{
 		showDetailed = true;
-		fixedWidth	   = fixedWidthAll;
+		fixedWidth	 = fixedWidthAll;
 	}
 
 	int barWidth = g_consoleWidth - fixedWidth;
@@ -1168,8 +1204,8 @@ void ConsoleUpdate()
 	};
 
 	g_currentColor = CYAN;
-	PutFormat("%-*s  %*s  %*s  ", nameWidth, "Process Name", memoryWidth-1, "Usage", memoryWidth-1, "Commit");
-	PutFormat("%*s  ", memoryWidth-1, "Demoted");
+	PutFormat("%-*s  %*s  %*s  ", nameWidth, "Process Name", memoryWidth - 1, "Usage", memoryWidth - 1, "Commit");
+	PutFormat("%*s  ", memoryWidth - 1, "Demoted");
 	if(showDetailed)
 	{
 		WritePrios();
@@ -1196,6 +1232,8 @@ void ConsoleUpdate()
 			if(procMem->CommitmentLocal == 0 && procMem->UsageLocal == 0)
 				continue;
 			Process* proc = FindProcess(procMem->pid);
+			if(proc->stopTime != 0)
+				continue;
 			if(proc->imageFilename.length() == 0)
 			{
 				proc->imagePath		= GetProcessName(procMem->pid);
@@ -1232,7 +1270,6 @@ void ConsoleUpdate()
 			g_currentColor = CYAN;
 			PutFormat(" %*s", memoryWidth, memBuffer);
 
-			
 			if(showDetailed)
 			{
 				int idx = 0;
@@ -1481,7 +1518,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 			ReadConsoleInput(g_hConsoleInput, &Record, 1, &Length);
 			WORD ch = Record.Event.KeyEvent.wVirtualKeyCode;
 			if(Record.Event.KeyEvent.bKeyDown && ch != 0)
-			{				
+			{
 				if(ch == 'G')
 				{
 					g_minSize = g_minSize == 3 ? 0 : 3;
