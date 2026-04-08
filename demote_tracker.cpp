@@ -772,13 +772,18 @@ void HandleDpiReportAdapter(PEVENT_RECORD pEvent)
 
 	LPVOID		   pDxgAdapter = GetProperty<LPVOID>(pEvent, proppDxgAdapter);
 	UINT64		   Luid		   = GetProperty<UINT64>(pEvent, propAdapterLuid);
-	IDXGIFactory4* pFactory;
-	CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void**)&pFactory);
+	IDXGIFactory4* pFactory	   = nullptr;
+	if(FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void**)&pFactory)))
+		return;
 	LUID luid;
 	memcpy(&luid, &Luid, sizeof(luid));
-	IDXGIAdapter1* pAdapter;
+	IDXGIAdapter1* pAdapter = nullptr;
 
-	pFactory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void**)&pAdapter);
+	if(FAILED(pFactory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void**)&pAdapter)))
+	{
+		pFactory->Release();
+		return;
+	}
 
 	DXGI_ADAPTER_DESC1 desc;
 	pAdapter->GetDesc1(&desc);
