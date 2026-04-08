@@ -522,18 +522,17 @@ void OnProcessStop(DWORD pid, uint64_t timestamp)
 }
 
 // VidMm reports arrive even after the process is dead.
-// keep Process objects alive for 2 minutes, and then trim them
+// keep Process objects alive for 2 minutes (check every 30s), and then trim them
 void TrimProcesses()
 {
 	LARGE_INTEGER Freq, Counter;
 	QueryPerformanceFrequency(&Freq);
 	QueryPerformanceCounter(&Counter);
 	static int64_t LastUpdate = 0;
-	if(LastUpdate < Counter.QuadPart + Freq.QuadPart * 30)
+	if(Counter.QuadPart > LastUpdate + Freq.QuadPart * 30)
 	{
 		LastUpdate	  = Counter.QuadPart;
-		int64_t limit = Counter.QuadPart + 120 * Freq.QuadPart;
-
+		int64_t limit = Counter.QuadPart - 120 * Freq.QuadPart;
 		for(Process& proc : g_processes)
 		{
 			DWORD pid = proc.pid;
